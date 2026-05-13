@@ -5,8 +5,8 @@ from app.models.schemas import BusquedaRequest
 from app.core.config import OLLAMA_HOST, OLLAMA_MODEL
 
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
-from langchain_community.chat_message_histories import ChatMessageHistory
 from langchain_core.runnables.history import RunnableWithMessageHistory
+from sentence_transformers.cross_encoder import CrossEncoder
 
 from app.core.memory import SupabaseChatMemory
 
@@ -19,21 +19,16 @@ llm = OllamaLLM(
     base_url=OLLAMA_HOST
 )
 
-memorias_de_sesion = {}
+cross_encoder = CrossEncoder('BAAI/bge-reranker-base')
 
 
 def obtener_historial_de_mensajes(session_id: str):
-    # if session_id not in memorias_de_sesion:
-    #     print(f'Creando nueva memoria para la sesión: {session_id}')
-    #     memorias_de_sesion[session_id] = ChatMessageHistory()
-    # return memorias_de_sesion[session_id]
-
     return SupabaseChatMemory(session_id)
 
 
 reescritor_prompt = ChatPromptTemplate.from_messages([
     MessagesPlaceholder(variable_name="history"),
-    ("user", "Dada la conversación anterior, genera una consulta de búsqueda autónoma sobre el último tema discutido. No respondas la pregunta, solo reformúlala. para poder contestar la nueva intencion teniendo en cuenta el contexto anterior"),
+    ("user", "Dada la conversación anterior, genera una consulta de búsqueda que sea autónoma y pueda ser entendida sin el historial. La consulta debe ser sobre el último tema discutido. No respondas la pregunta, solo reformúlala."),
     ("user", "{input}")
 ])
 
@@ -50,12 +45,18 @@ Reglas estrictas:
 - Nunca uses frases como "según...", "basándome en...", "de acuerdo con...".
 - Si no tienes información sobre algo, di: "Por el momento no tengo esa información, pero puedes contactarnos en comunicaciones@colombiacomparte.com"
 - Responde de forma directa, clara y amigable.
+     
+- Responde ÚNICAMENTE con información presente en el contexto proporcionado.
+- Si la pregunta pide algo que no está textualmente en el contexto (como una "visión" que no existe), 
+  NO la inventes ni la inferras. Usa la frase de contacto.
+- Nunca completes información que no esté explícita.
 
 Información disponible:
 {contexto}'''),
     MessagesPlaceholder(variable_name="history"),
     ("human", "{input}")
 ])
+
 
 cadena_conversacional = prompt_principal | llm
 
@@ -72,6 +73,7 @@ async def responder_con_rag_y_memoria(payload: BusquedaRequest):
     try:
         historial = obtener_historial_de_mensajes(payload.session_id)
 
+        # Reescritura solo si hay historial
         if historial.messages:
             consulta_reescrita = await cadena_reescritura.ainvoke({
                 "history": historial.messages,
@@ -83,24 +85,50 @@ async def responder_con_rag_y_memoria(payload: BusquedaRequest):
             consulta_reescrita = payload.consulta
             print(f"Primer mensaje, sin reescritura: '{consulta_reescrita}'")
 
-        # Buscar contexto con la consulta reescrita
         payload_busqueda = BusquedaRequest(
             consulta=consulta_reescrita,
-            session_id=payload.session_id
+            session_id=payload.session_id,
+            top_k=10
         )
         contexto_chunks = buscar_documento(payload_busqueda)
-        contexto_str = "\n\n".join(
-            chunk['texto'] for chunk in contexto_chunks['resultados']
-        )
+        print("--- Contenido de los Chunks Recuperados ---")
+        for i, chunk in enumerate(contexto_chunks['resultados']):
+            print(f"--- Chunk {i + 1} ---")
+            print(chunk['texto'])
+            print("\n")
 
-        # Generar respuesta con historial
+        pares_para_rerank = []
+        for chunk in contexto_chunks['resultados']:
+            pares_para_rerank.append([consulta_reescrita, chunk['texto']])
+
+        puntajes = cross_encoder.predict(pares_para_rerank)
+
+        for i in range(len(contexto_chunks['resultados'])):
+            contexto_chunks['resultados'][i]['relevance_score'] = puntajes[i]
+
+        chunks_reordenados = sorted(
+            contexto_chunks['resultados'], key=lambda x: x['relevance_score'], reverse=True)
+
+        contexto_final_chunks = chunks_reordenados[:3]
+
+        print("--- Documentos Re-ordenados ---")
+        for chunk in contexto_final_chunks:
+            print(f"--- Chunk ---")
+            print(f"Puntaje: {chunk['relevance_score']:.4f}")
+            print(chunk['texto'])
+            print("\n")
+
+        contexto_str = "".join(chunk['texto']
+                               for chunk in contexto_final_chunks)
+
         config = {"configurable": {"session_id": payload.session_id}}
-        respuesta = await cadena_con_historial.ainvoke({
+
+        respuesta_generada = await cadena_con_historial.ainvoke({
             "input": payload.consulta,
             "contexto": contexto_str,
         }, config=config)
 
-        return {'respuesta': respuesta}
+        return {'respuesta': respuesta_generada}
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
