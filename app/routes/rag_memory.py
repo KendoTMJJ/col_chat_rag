@@ -67,21 +67,31 @@ cadena_con_historial = RunnableWithMessageHistory(
 )
 
 
+PRONOUNS = {"esto","eso","aquello","él","ella","ellos","ellas","ese","esa","esos","esas","ahí","allí","allá","lo","la","los","las","le","les","me","te","se","nos"}
+
+def _necesita_reescritura(consulta: str, tiene_historial: bool) -> bool:
+    if not tiene_historial:
+        return False
+    palabras = consulta.lower().split()
+    if len(palabras) >= 8:
+        return False
+    primera = palabras[0] if palabras else ""
+    return primera in PRONOUNS or consulta.strip().endswith("?") and len(palabras) <= 4
+
 @router.post('/')
 async def responder_con_rag_y_memoria(payload: BusquedaRequest):
     try:
         historial = obtener_historial_de_mensajes(payload.session_id)
 
-        if historial.messages:
+        if _necesita_reescritura(payload.consulta, bool(historial.messages)):
             consulta_reescrita = await cadena_reescritura.ainvoke({
                 "history": historial.messages,
                 "input": payload.consulta
             })
-            print(
-                f"Consulta original: '{payload.consulta}' -> Reescrita: '{consulta_reescrita}'")
+            print(f"Consulta reescrita: '{payload.consulta}' -> '{consulta_reescrita}'")
         else:
             consulta_reescrita = payload.consulta
-            print(f"Primer mensaje, sin reescritura: '{consulta_reescrita}'")
+            print(f"Sin reescritura: '{consulta_reescrita}'")
 
         # Buscar contexto con la consulta reescrita
         payload_busqueda = BusquedaRequest(
